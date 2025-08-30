@@ -1,0 +1,227 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: baby-monitor-db
+    environment:
+      POSTGRES_DB: baby_monitor
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - baby-monitor-network
+
+  # Redis Cache
+  redis:
+    image: redis:7-alpine
+    container_name: baby-monitor-redis
+    command: redis-server --appendonly yes --requirepass redispassword
+    volumes:
+      - redis_data:/data
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "--raw", "incr", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    networks:
+      - baby-monitor-network
+
+  # Kafka
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: baby-monitor-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_logs:/var/lib/zookeeper/log
+    networks:
+      - baby-monitor-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: baby-monitor-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - baby-monitor-network
+
+  # MinIO (S3 Compatible Storage)
+  minio:
+    image: minio/minio:latest
+    container_name: baby-monitor-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin123
+    volumes:
+      - minio_data:/data
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    networks:
+      - baby-monitor-network
+
+  # FastAPI Backend
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: baby-monitor-api
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@postgres:5432/baby_monitor
+      - REDIS_URL=redis://:redispassword@redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - AWS_ACCESS_KEY_ID=minioadmin
+      - AWS_SECRET_ACCESS_KEY=minioadmin123
+      - AWS_ENDPOINT_URL=http://minio:9000
+      - S3_BUCKET_NAME=baby-monitor-recordings
+      - SECRET_KEY=super-secret-key-change-in-production
+      - DEBUG=true
+    volumes:
+      - ./backend:/app
+      - ./ml-models:/app/models
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - baby-monitor-network
+
+  # ML Inference Worker
+  ml-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: baby-monitor-ml-worker
+    command: python -m app.ml.inference_service
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@postgres:5432/baby_monitor
+      - REDIS_URL=redis://:redispassword@redis:6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+      - AUDIO_MODEL_PATH=/app/models/audio_classifier.onnx
+      - VIDEO_MODEL_PATH=/app/models/yolo_detector.onnx
+    volumes:
+      - ./backend:/app
+      - ./ml-models:/app/models
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - backend
+    networks:
+      - baby-monitor-network
+
+  # Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: baby-monitor-prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      - baby-monitor-network
+
+  # Grafana
+  grafana:
+    image: grafana/grafana:latest
+    container_name: baby-monitor-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin123
+      - GF_INSTALL_PLUGINS=grafana-clock-panel,grafana-simple-json-datasource
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    networks:
+      - baby-monitor-network
+
+  # Nginx Reverse Proxy
+  nginx:
+    image: nginx:alpine
+    container_name: baby-monitor-nginx
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf
+      - ./infrastructure/nginx/conf.d:/etc/nginx/conf.d
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      - backend
+      - grafana
+    networks:
+      - baby-monitor-network
+
+volumes:
+  postgres_data:
+  redis_data:
+  zookeeper_data:
+  zookeeper_logs:
+  kafka_data:
+  minio_data:
+  prometheus_data:
+  grafana_data:
+
+networks:
+  baby-monitor-network:
+    driver: bridge
