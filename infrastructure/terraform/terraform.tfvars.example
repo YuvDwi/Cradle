@@ -1,0 +1,58 @@
+# AWS Configuration
+aws_region = "us-west-2"
+environment = "dev"
+project_name = "baby-monitor"
+
+# Network Configuration
+vpc_cidr = "10.0.0.0/16"
+
+# Database Configuration
+db_instance_class = "db.t3.micro"
+db_username = "postgres"
+db_password = "your-secure-password-here"
+backup_retention_days = 7
+multi_az = false
+
+# Redis Configuration
+redis_node_type = "cache.t3.micro"
+redis_auth_token = "your-redis-auth-token-here"
+
+# ECS Configuration
+api_cpu = 512
+api_memory = 1024
+ml_worker_cpu = 1024
+ml_worker_memory = 2048
+
+api_desired_count = 2
+ml_worker_desired_count = 1
+
+# Auto Scaling Configuration
+auto_scaling_enabled = true
+auto_scaling_min_capacity = 1
+auto_scaling_max_capacity = 10
+auto_scaling_target_cpu = 70
+auto_scaling_target_memory = 80
+
+# Container Images
+ecr_repository_url = "123456789012.dkr.ecr.us-west-2.amazonaws.com/baby-monitor"
+api_image_tag = "latest"
+ml_worker_image_tag = "latest"
+
+# Domain Configuration (optional)
+domain_name = "api.babymonitor.example.com"
+certificate_arn = ""
+enable_https = false
+
+# Kafka Configuration (optional)
+kafka_enable = false
+kafka_instance_type = "kafka.t3.small"
+
+# Monitoring
+enable_monitoring = true
+
+# Additional Tags
+tags = {
+  Owner = "DevOps Team"
+  Purpose = "Baby Monitor Application"
+  CostCenter = "Engineering"
+}
