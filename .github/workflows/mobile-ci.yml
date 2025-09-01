@@ -1,0 +1,352 @@
+name: Mobile CI/CD
+
+on:
+  push:
+    branches: [main, develop]
+    paths:
+      - 'mobile/**'
+      - '.github/workflows/mobile-ci.yml'
+  pull_request:
+    branches: [main, develop]
+    paths:
+      - 'mobile/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: mobile/package-lock.json
+
+    - name: Install dependencies
+      run: |
+        cd mobile
+        npm ci
+
+    - name: Run linter
+      run: |
+        cd mobile
+        npm run lint
+
+    - name: Run tests
+      run: |
+        cd mobile
+        npm test -- --coverage --watchAll=false
+
+    - name: Upload coverage
+      uses: codecov/codecov-action@v3
+      with:
+        file: ./mobile/coverage/lcov.info
+        flags: mobile
+        name: mobile-coverage
+
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install dependencies
+      run: |
+        cd mobile
+        npm ci
+
+    - name: Run security audit
+      run: |
+        cd mobile
+        npm audit --audit-level=high
+
+    - name: License check
+      run: |
+        cd mobile
+        npx license-checker --summary
+
+  build-android:
+    needs: [test, security-scan]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: mobile/package-lock.json
+
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: 'zulu'
+        java-version: '17'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Install dependencies
+      run: |
+        cd mobile
+        npm ci
+
+    - name: Create environment config
+      run: |
+        cd mobile
+        cat > .env << EOF
+        API_BASE_URL=${{ secrets.API_BASE_URL }}
+        WS_BASE_URL=${{ secrets.WS_BASE_URL }}
+        FIREBASE_CONFIG=${{ secrets.FIREBASE_CONFIG }}
+        EOF
+
+    - name: Build Android APK
+      run: |
+        cd mobile
+        npx react-native build-android --mode=release
+
+    - name: Sign APK
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cd mobile/android/app/build/outputs/apk/release
+        jarsigner -verbose -sigalg SHA256withRSA -digestalg SHA-256 \
+          -keystore ${{ secrets.ANDROID_KEYSTORE_FILE }} \
+          -storepass ${{ secrets.ANDROID_KEYSTORE_PASSWORD }} \
+          -keypass ${{ secrets.ANDROID_KEY_PASSWORD }} \
+          app-release-unsigned.apk ${{ secrets.ANDROID_KEY_ALIAS }}
+        
+        $ANDROID_HOME/build-tools/33.0.0/zipalign -v 4 \
+          app-release-unsigned.apk app-release.apk
+
+    - name: Upload APK artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: android-apk
+        path: mobile/android/app/build/outputs/apk/release/app-release*.apk
+
+  build-ios:
+    needs: [test, security-scan]
+    runs-on: macos-latest
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+        cache: 'npm'
+        cache-dependency-path: mobile/package-lock.json
+
+    - name: Setup Xcode
+      uses: maxim-lobanov/setup-xcode@v1
+      with:
+        xcode-version: latest-stable
+
+    - name: Install dependencies
+      run: |
+        cd mobile
+        npm ci
+
+    - name: Install CocoaPods
+      run: |
+        cd mobile/ios
+        pod install
+
+    - name: Create environment config
+      run: |
+        cd mobile
+        cat > .env << EOF
+        API_BASE_URL=${{ secrets.API_BASE_URL }}
+        WS_BASE_URL=${{ secrets.WS_BASE_URL }}
+        FIREBASE_CONFIG=${{ secrets.FIREBASE_CONFIG }}
+        EOF
+
+    - name: Build iOS app
+      run: |
+        cd mobile
+        npx react-native build-ios --mode=Release
+
+    - name: Archive iOS app
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cd mobile/ios
+        xcodebuild -workspace BabyMonitor.xcworkspace \
+          -scheme BabyMonitor \
+          -configuration Release \
+          -archivePath BabyMonitor.xcarchive \
+          archive
+
+    - name: Export IPA
+      if: github.ref == 'refs/heads/main'
+      run: |
+        cd mobile/ios
+        xcodebuild -exportArchive \
+          -archivePath BabyMonitor.xcarchive \
+          -exportPath . \
+          -exportOptionsPlist ExportOptions.plist
+
+    - name: Upload IPA artifact
+      if: github.ref == 'refs/heads/main'
+      uses: actions/upload-artifact@v3
+      with:
+        name: ios-ipa
+        path: mobile/ios/*.ipa
+
+  deploy-firebase:
+    needs: [build-android, build-ios]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download Android APK
+      uses: actions/download-artifact@v3
+      with:
+        name: android-apk
+        path: ./artifacts/
+
+    - name: Setup Firebase CLI
+      uses: w9jds/firebase-action@master
+      with:
+        args: --version
+      env:
+        FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+
+    - name: Upload to Firebase App Distribution
+      run: |
+        firebase appdistribution:distribute artifacts/app-release.apk \
+          --app ${{ secrets.FIREBASE_ANDROID_APP_ID }} \
+          --release-notes "Automated build from commit ${{ github.sha }}" \
+          --groups "internal-testers"
+      env:
+        FIREBASE_TOKEN: ${{ secrets.FIREBASE_TOKEN }}
+
+  deploy-testflight:
+    needs: build-ios
+    runs-on: macos-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download iOS IPA
+      uses: actions/download-artifact@v3
+      with:
+        name: ios-ipa
+        path: ./artifacts/
+
+    - name: Upload to TestFlight
+      run: |
+        xcrun altool --upload-app \
+          --type ios \
+          --file artifacts/*.ipa \
+          --username ${{ secrets.APPLE_ID_EMAIL }} \
+          --password ${{ secrets.APPLE_ID_PASSWORD }}
+
+  deploy-play-store:
+    needs: build-android
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Download Android APK
+      uses: actions/download-artifact@v3
+      with:
+        name: android-apk
+        path: ./artifacts/
+
+    - name: Setup Google Play CLI
+      run: |
+        echo '${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}' > service-account.json
+
+    - name: Upload to Google Play Internal Testing
+      uses: r0adkll/upload-google-play@v1
+      with:
+        serviceAccountJsonPlainText: ${{ secrets.GOOGLE_PLAY_SERVICE_ACCOUNT_JSON }}
+        packageName: com.babymonitor.app
+        releaseFiles: artifacts/app-release.apk
+        track: internal
+        status: completed
+
+  performance-test:
+    needs: [build-android, build-ios]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '18'
+
+    - name: Install Detox CLI
+      run: npm install -g detox-cli
+
+    - name: Run E2E tests
+      run: |
+        cd mobile
+        npm ci
+        detox build --configuration android.emu.release
+        detox test --configuration android.emu.release --headless
+
+    - name: Upload test results
+      if: always()
+      uses: actions/upload-artifact@v3
+      with:
+        name: e2e-test-results
+        path: mobile/e2e/artifacts/
+
+  notify:
+    needs: [deploy-firebase, deploy-testflight, deploy-play-store]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+    - name: Notify Slack on success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#mobile-releases'
+        text: 'Mobile app deployment successful! :iphone:'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    - name: Notify Slack on failure
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#mobile-releases'
+        text: 'Mobile app deployment failed! :x:'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
