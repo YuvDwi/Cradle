@@ -1,0 +1,57 @@
+name: clean files
+
+on:
+  workflow_dispatch: # run manually
+
+permissions:
+  contents: write
+
+jobs:
+  squash:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find commits from past 24h
+        id: recent
+        run: |
+          COMMITS=$(git log --since="24 hours ago" --pretty=format:"%H" | tr '\n' ' ')
+          echo "commits=$COMMITS" >> $GITHUB_OUTPUT
+
+      - name: Configure Git identity
+        run: |
+          git config user.name "Yuvraj Dwivedi"
+          git config user.email "anon@example.com"
+
+      - name: Squash commits if any
+        if: ${{ steps.recent.outputs.commits != '' }}
+        run: |
+          # Get oldest commit in last 24h
+          FIRST_COMMIT=$(git log --since="24 hours ago" --reverse --pretty=format:"%H" | head -n 1)
+
+          if [ -z "$FIRST_COMMIT" ]; then
+            echo "No commits in last 24h, skipping squash."
+            exit 0
+          fi
+
+          PARENT=$(git rev-parse $FIRST_COMMIT^)
+
+          echo "Squashing commits since: $FIRST_COMMIT (parent: $PARENT)"
+
+          # Reset branch back before the first commit of the window
+          git reset --soft $PARENT
+
+          # Re-commit all changes from last 24h
+          git commit -m "Edited file"
+
+      - name: Set remote URL
+        run: |
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+
+      - name: Force push
+        run: |
+          git push origin HEAD:main --force
